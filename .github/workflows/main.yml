@@ -1,0 +1,178 @@
+name: OpenWrt-CI
+
+on:
+  push:
+    branches:
+      - master
+  # schedule:
+  #   - cron: 0 20 * * *
+
+jobs:
+
+  build_openwrt:
+
+    name: Build OpenWrt firmware
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Get tags
+        run : |
+          git fetch --tags https://github.com/immortalwrt/immortalwrt.git
+          git push --tags
+          echo "tag=$(git tag | sort | tail -1)" >> $GITHUB_ENV
+
+      - name: Checkout to tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.tag }}
+
+      - name: Add Patch
+        run: |
+          # wget -O $(ls -d ./target/linux/x86/patches-*)/600-bnx2x-warpcore-8727-2g5.patch https://raw.githubusercontent.com/JAMESMTL/snippets/master/bnx2x/patches/bnx2x_warpcore_8727_2_5g_sgmii_txfault.patch
+          # wget -O ./package/network/utils/iptables/patches/600-fix-among-match.patch https://git.netfilter.org/iptables/patch/?id=eddbb27651b93ac6f329bf8113223e7360ea7613
+
+      - name: Git Clone
+        run: |
+          git clone https://github.com/rufengsuixing/luci-app-adguardhome package/luci/luci-app-adguardhome
+          # git clone https://github.com/khrozelfist/3proxy-openwrt package/net/3proxy
+          # git clone https://github.com/v2rayA/v2raya-openwrt package/net/v2raya
+
+      - name: Space cleanup
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi `docker images -q`
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d /usr/local/lib/android
+          sudo -E apt-get -y purge azure-cli ghc* zulu* hhvm llvm* firefox google* dotnet* powershell openjdk* adoptopenjdk* mysql* php* mongodb* dotnet* moby* snapd* || true
+          sudo -E apt-get update
+          sudo -E apt-get -y install build-essential asciidoc binutils bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 unzip zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs gcc-multilib g++-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler antlr3 gperf swig libtinfo5
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+
+          sudo mkdir -p -m 777 /mnt/openwrt/bin /mnt/openwrt/build_dir/host /mnt/openwrt/build_dir/hostpkg /mnt/openwrt/dl /mnt/openwrt/feeds /mnt/openwrt/staging_dir
+          ln -s /mnt/openwrt/bin ./bin
+          mkdir -p ./build_dir
+          ln -s -f /mnt/openwrt/build_dir/host ./build_dir/host
+          ln -s -f /mnt/openwrt/build_dir/hostpkg ./build_dir/hostpkg
+          ln -s /mnt/openwrt/dl ./dl
+          ln -s /mnt/openwrt/feeds ./feeds
+          ln -s /mnt/openwrt/staging_dir ./staging_dir
+
+          df -h
+
+      - name: Update feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Other
+        run: |
+          sed -i '/DEFAULT:=n/d' feeds/packages/net/rp-pppoe/Makefile
+          
+          mkdir -p ./firmware/i915
+          curl -L https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/i915/icl_dmc_ver1_09.bin -o ./firmware/i915/icl_dmc_ver1_09.bin
+          echo 'CONFIG_FIRMWARE_IN_KERNEL=y' >> ./target/linux/x86/64/config-5.15
+          echo 'CONFIG_EXTRA_FIRMWARE="i915/glk_dmc_ver1_04.bin"' >> ./target/linux/x86/64/config-5.15
+          echo 'CONFIG_EXTRA_FIRMWARE_DIR="./openwrt/firmware"' >> ./target/linux/x86/64/config-5.15
+
+      - name: Generate configuration file
+        run: |
+          ver=$(echo ${{ env.tag }} | cut -c 2-)
+
+          rm -f ./.config*
+          curl https://downloads.immortalwrt.org/releases/$ver/targets/x86/64/config.buildinfo | grep CONFIG_TARGET_ >> ./.config
+          curl https://downloads.immortalwrt.org/releases/$ver/targets/x86/64/config.buildinfo | grep CONFIG_PACKAGE_ >> ./.config
+          curl https://downloads.immortalwrt.org/releases/$ver/targets/x86/64/config.buildinfo | grep CONFIG_VERSION >> ./.config
+
+          sed -i 's/CONFIG_TARGET_MULTI_PROFILE=y/CONFIG_TARGET_MULTI_PROFILE=n/' ./.config
+          sed -i 's/CONFIG_TARGET_PER_DEVICE_ROOTFS=y/CONFIG_TARGET_PER_DEVICE_ROOTFS=n/' ./.config
+          sed -i 's/CONFIG_TARGET_ALL_PROFILES=y/CONFIG_TARGET_ALL_PROFILES=n/' ./.config
+
+          echo CONFIG_KERNEL_BUILD_DOMAIN="Azure" >> ./.config
+          echo CONFIG_KERNEL_BUILD_USER="OpenWrt-CI" >> ./.config
+
+          cat >> .config <<EOF
+          CONFIG_TARGET_ROOTFS_TARGZ=n
+          CONFIG_TARGET_ROOTFS_SQUASHFS=n
+          EOF
+
+          cat >> .config <<EOF
+          CONFIG_PACKAGE_kmod-tcp-bbr=y
+          CONFIG_PACKAGE_kmod-fs-ext4=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-nft-netdev=y
+          CONFIG_PACKAGE_wpad-mbedtls=y
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-app-upnp=y
+          CONFIG_PACKAGE_luci-app-vlmcsd=y
+          CONFIG_PACKAGE_luci-app-smartdns=y
+          CONFIG_PACKAGE_luci-app-softethervpn=y
+          CONFIG_PACKAGE_luci-app-zerotier=y
+          CONFIG_PACKAGE_luci-app-dockerman=y
+          EOF
+
+          make defconfig
+
+      - name: Make download
+        run: |
+          make download -j8 || make download -j1 V=s
+          rm -rf $(find ./dl/ -size -1024c)
+          df -h
+
+      - name: Compile firmware
+        run: |
+          make -j$(nproc) || make -j1 V=s
+          echo "======================="
+          echo "Space usage:"
+          echo "======================="
+          df -h
+          echo "======================="
+          du -h ./ --max-depth=1
+          du -h /mnt/openwrt/ --max-depth=1 || true
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p ./artifact/firmware
+          mkdir -p ./artifact/package
+          mkdir -p ./artifact/buildinfo
+          rm -rf $(find ./bin/targets/ -type d -name "packages")
+          cp -rf $(find ./bin/targets/ -type f) ./artifact/firmware/
+          cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact/package/
+          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
+
+          # rm -rf $(find ./artifact/firmware/ -type f -name "*.tar.gz")
+          # rm -rf $(find ./artifact/firmware/ -type f -name "*.bin")
+          rm -rf $(find ./artifact/firmware/ -type f -name "*.img*" | grep -v "combined-efi")
+
+      - name: Deliver buildinfo
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_buildinfo
+          path: ./artifact/buildinfo/
+
+      - name: Deliver package
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_package
+          path: ./artifact/package/
+
+      - name: Deliver firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_firmware
+          path: ./artifact/firmware/
+
+      - name: Upload release asset
+        if: github.event == 'release'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          file: ./artifact/firmware/*
+          tag: ${{ github.ref }}
+          file_glob: true
